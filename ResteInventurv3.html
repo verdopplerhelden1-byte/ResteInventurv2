@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8" />
+    <title>Barcode-Prüfung mit Excel-Liste</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <script src="https://unpkg.com/html5-qrcode"></script>
+
+    <style>
+        body { font-family: sans-serif; margin: 1rem; }
+        h1 { font-size: 1.3rem; }
+        .section {
+            margin-bottom: 1.2rem;
+            padding: 0.8rem;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+        }
+        #reader { width: 100%; max-width: 400px; margin-top: 0.5rem; }
+        table { width: 100%; border-collapse: collapse; margin-top: 0.8rem; }
+        th, td { border: 1px solid #ddd; padding: 0.4rem; text-align: left; }
+        th { background: #f0f0f0; }
+        .ok { color: #0a7a0a; font-weight: bold; }
+        .error { color: #c00; font-weight: bold; }
+        .small { font-size: 0.85rem; color: #555; }
+        button {
+            padding: 0.5rem 0.9rem;
+            border-radius: 6px;
+            border: 1px solid #999;
+            background: #f5f5f5;
+        }
+        button:disabled { opacity: 0.5; }
+    </style>
+</head>
+<body>
+<h1>Barcode-Prüfung mit Excel-Liste</h1>
+
+<div class="section">
+    <strong>1. Excel-/CSV-Liste laden</strong><br />
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" />
+    <div class="small">
+        Die Nummern werden aus dem ersten Tabellenblatt gelesen (1. Spalte).<br>
+        Jede Zeile = eine zulässige Nummer.
+    </div>
+    <p id="listInfo" class="small"></p>
+</div>
+
+<div class="section">
+    <strong>2. Barcode mit Kamera scannen</strong><br />
+    <button id="startBtn" disabled>Kamera-Scanner starten</button>
+    <button id="stopBtn" disabled>Stoppen</button>
+    <div id="reader"></div>
+    <p id="lastScan" class="small"></p>
+</div>
+
+<div class="section">
+    <strong>3. Ergebnisse</strong>
+    <table>
+        <thead>
+        <tr>
+            <th>Nummer</th>
+            <th>Status</th>
+        </tr>
+        </thead>
+        <tbody id="resultBody"></tbody>
+    </table>
+</div>
+
+<script>
+    let validCodes = new Set();
+    let scannedRows = new Map();
+    let html5QrCode = null;
+
+    function addCode(rawValue) {
+        let c = String(rawValue || "").trim().toUpperCase();
+        if (!c) return;
+        c = c.replace(/\s+/g, "");
+        if (c.startsWith("R")) {
+            validCodes.add(c);
+            validCodes.add(c.substring(1));
+        } else {
+            validCodes.add(c);
+        }
+    }
+
+    fileInput.addEventListener("change", function (e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+
+        reader.onload = function (evt) {
+            try {
+                validCodes = new Set();
+
+                if (file.name.toLowerCase().endsWith(".csv")) {
+                    const text = evt.target.result;
+                    text.split(/\r?\n/).forEach(line => {
+                        addCode(line.split(/[;,]/)[0]);
+                    });
+                } else {
+                    const data = new Uint8Array(evt.target.result);
+                    const workbook = XLSX.read(data, {type: "array"});
+                    const firstSheetName = workbook.SheetNames[0];
+                    const json = XLSX.utils.sheet_to_json(
+                        workbook.Sheets[firstSheetName],
+                        {header: 1, defval: ""}
+                    );
+                    json.forEach(row => addCode(row[0]));
+                }
+
+                listInfo.textContent = "Geladene Nummern: " + validCodes.size;
+                startBtn.disabled = validCodes.size === 0;
+            } catch (err) {
+                alert("Fehler beim Lesen der Datei: " + err);
+            }
+        };
+
+        if (file.name.toLowerCase().endsWith(".csv"))
+            reader.readAsText(file, "UTF-8");
+        else
+            reader.readAsArrayBuffer(file);
+    });
+
+    startBtn.addEventListener("click", async () => {
+        if (html5QrCode) return;
+        html5QrCode = new Html5Qrcode("reader");
+
+        try {
+            const cameras = await Html5Qrcode.getCameras();
+            if (!cameras.length) return alert("Keine Kamera gefunden.");
+
+            await html5QrCode.start(
+                cameras[0].id,
+                { fps: 10, qrbox: {width: 250, height: 150} },
+                onScanSuccess
+            );
+
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+        } catch (err) {
+            alert("Fehler beim Starten der Kamera: " + err);
+        }
+    });
+
+    stopBtn.addEventListener("click", async () => {
+        if (!html5QrCode) return;
+        await html5QrCode.stop();
+        html5QrCode.clear();
+        html5QrCode = null;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+    });
+
+    function onScanSuccess(decodedText) {
+        const code = decodedText.trim().toUpperCase().replace(/\s+/g, "");
+        const ok = validCodes.has(code);
+        showResult(code, ok);
+        lastScan.textContent = "Letzter Scan: " + code + (ok ? " (OK)" : " (fehlerhaft)");
+    }
+
+    function showResult(code, ok) {
+        let row = scannedRows.get(code);
+        if (!row) {
+            row = document.createElement("tr");
+            row.innerHTML = "<td>" + code + "</td><td></td>";
+            resultBody.appendChild(row);
+            scannedRows.set(code, row);
+        }
+        const statusCell = row.cells[1];
+        if (ok) {
+            statusCell.textContent = "erledigt";
+            statusCell.className = "ok";
+        } else {
+            statusCell.textContent = "fehlerhaft";
+            statusCell.className = "error";
+        }
+    }
+</script>
+</body>
+</html>
