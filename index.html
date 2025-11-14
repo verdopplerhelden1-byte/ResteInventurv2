@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<title>Reste-Inventur v3</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://unpkg.com/html5-qrcode"></script>
+
+<style>
+body { font-family: sans-serif; margin: 1rem; }
+.section { margin-bottom: 1.2rem; padding: 0.8rem; border: 1px solid #ccc; border-radius: 8px; }
+#reader { width: 100%; max-width: 400px; margin-top: 0.5rem; }
+
+/* Kamera Fix */
+#reader video {
+    transform: rotate(0deg) !important;
+    -webkit-transform: rotate(0deg) !important;
+    object-fit: cover !important;
+}
+
+.ok { color: green; font-weight: bold; }
+.error { color: red; font-weight: bold; }
+table { width:100%; border-collapse: collapse; margin-top: 1rem; }
+td,th { border:1px solid #ccc; padding:6px; }
+</style>
+</head>
+
+<body>
+<h1>Inventur Scanner v3</h1>
+
+<div class="section">
+<strong>1. Excel laden</strong><br>
+<input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+<p id="listInfo"></p>
+</div>
+
+<div class="section">
+<strong>2. Scannen</strong><br>
+<button id="startBtn" disabled>Scanner starten</button>
+<button id="stopBtn" disabled>Stoppen</button>
+<div id="reader"></div>
+<p id="lastScan"></p>
+</div>
+
+<div class="section">
+<strong>3. Ergebnisse</strong>
+<table>
+<thead><tr><th>Nummer</th><th>Status</th></tr></thead>
+<tbody id="resultBody"></tbody>
+</table>
+</div>
+
+<script>
+let validCodes = new Set();
+let html5QrCode = null;
+
+fileInput.addEventListener("change", e => {
+    const file = e.target.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+
+    reader.onload = evt => {
+        validCodes = new Set();
+        if(file.name.toLowerCase().endsWith(".csv")){
+            evt.target.result.split(/\r?\n/)
+                .forEach(l => addCode(l.split(/[;,]/)[0]));
+        } else {
+            const data = new Uint8Array(evt.target.result);
+            const wb = XLSX.read(data, {type:"array"});
+            const sheet = wb.Sheets[wb.SheetNames[0]];
+            const rows = XLSX.utils.sheet_to_json(sheet,{header:1,defval:""});
+            rows.forEach(r => addCode(r[0]));
+        }
+        listInfo.textContent = "Geladene Nummern: " + validCodes.size;
+        startBtn.disabled = validCodes.size === 0;
+    };
+    if(file.name.toLowerCase().endsWith(".csv")) reader.readAsText(file);
+    else reader.readAsArrayBuffer(file);
+});
+
+function addCode(val){
+    if(!val) return;
+    let c = String(val).trim().toUpperCase().replace(/\s+/g,"");
+    if(c.startsWith("R")){
+        validCodes.add(c);
+        validCodes.add(c.substring(1));
+    } else validCodes.add(c);
+}
+
+startBtn.addEventListener("click", async ()=>{
+    if(html5QrCode) return;
+    html5QrCode = new Html5Qrcode("reader");
+
+    const cams = await Html5Qrcode.getCameras();
+    if(!cams.length){ alert("Keine Kamera gefunden."); return; }
+
+    await html5QrCode.start(
+        cams[0].id,
+        { fps:10, qrbox:{width:250,height:150}, disableFlip:true },
+        text => handleScan(text)
+    );
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+});
+
+stopBtn.addEventListener("click", async ()=>{
+    if(!html5QrCode) return;
+    await html5QrCode.stop();
+    html5QrCode.clear();
+    html5QrCode = null;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+});
+
+function handleScan(code){
+    code = code.trim().toUpperCase();
+    const ok = validCodes.has(code);
+    lastScan.textContent = "Letzter Scan: " + code + (ok ? " ✔" : " ✖");
+
+    const t = document.createElement("tr");
+    t.innerHTML = "<td>"+code+"</td><td class='"+(ok?"ok":"error")+"'>"
+        +(ok?"erledigt":"fehlerhaft")+"</td>";
+    resultBody.appendChild(t);
+}
+</script>
+
+</body>
+</html>
