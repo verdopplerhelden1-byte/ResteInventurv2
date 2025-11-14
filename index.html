@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <title>Inventur-Scanner (Nummern-OCR)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Excel im Browser lesen/schreiben -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <!-- Tesseract.js für Texterkennung (nur Ziffern) -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@2/dist/tesseract.min.js"></script>
+  <style>
+    body {
+      font-family: sans-serif;
+      padding: 10px;
+    }
+    h1 {
+      font-size: 1.2rem;
+    }
+    .controls {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    input[type="file"],
+    input[type="text"],
+    button {
+      font-size: 1rem;
+      padding: 6px 8px;
+    }
+    #cameraArea {
+      margin: 10px 0;
+      text-align: center;
+    }
+    video {
+      width: 100%;
+      max-width: 420px;
+      border: 2px solid #ccc;
+      border-radius: 4px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 0.85rem;
+    }
+    th, td {
+      border: 1px solid #ccc;
+      padding: 4px;
+      word-break: break-all;
+    }
+    th {
+      background: #eee;
+    }
+    tr.found {
+      background: #c8e6c9; /* grünlich */
+    }
+    tr.newitem {
+      background: #ffcdd2; /* rötlich */
+    }
+  </style>
+</head>
+<body>
+
+<h1>Inventur-Scanner (Nummern erkennen)</h1>
+
+<div class="controls">
+  <label>
+    Excel-Datei laden (XLSX oder CSV):
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" />
+  </label>
+
+  <button id="startCamBtn" disabled>📷 Kamera starten</button>
+  <button id="captureBtn" disabled>🔍 Nummer aus Bild erkennen</button>
+  <button id="stopCamBtn" disabled>⛔ Kamera stoppen</button>
+
+  <label>
+    Nummer manuell eingeben:
+    <input type="text" id="manualInput" placeholder="z.B. 300226002" />
+    <button id="manualOkBtn" type="button">OK</button>
+  </label>
+
+  <button id="saveBtn" disabled>💾 Liste als Excel speichern</button>
+</div>
+
+<div id="cameraArea">
+  <video id="video" autoplay playsinline></video>
+  <canvas id="captureCanvas" style="display:none;"></canvas>
+</div>
+
+<p id="statusText"><strong>Bitte zuerst Excel-Datei laden.</strong></p>
+
+<table id="dataTable">
+  <thead>
+    <tr>
+      <th>Nummer (Spalte A)</th>
+      <th>Beschreibung (Spalte B)</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+  // Daten aus der Excel-Tabelle (Array-of-Arrays)
+  let rows = [];
+  const foundRows = new Set();
+  const newRows = new Set();
+  let currentSheetName = "Tabelle1";
+
+  // Kamera
+  let videoStream = null;
+
+  const fileInput = document.getElementById("fileInput");
+  const dataTableBody = document.querySelector("#dataTable tbody");
+  const statusText = document.getElementById("statusText");
+  const startCamBtn = document.getElementById("startCamBtn");
+  const captureBtn = document.getElementById("captureBtn");
+  const stopCamBtn = document.getElementById("stopCamBtn");
+  const manualInput = document.getElementById("manualInput");
+  const manualOkBtn = document.getElementById("manualOkBtn");
+  const saveBtn = document.getElementById("saveBtn");
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("captureCanvas");
+
+  // Excel-Datei laden
+  fileInput.addEventListener("change", (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const data = new Uint8Array(evt.target.result);
+      const wb = XLSX.read(data, { type: "array" });
+
+      currentSheetName = wb.SheetNames[0];
+      const ws = wb.Sheets[currentSheetName];
+
+      rows = XLSX.utils.sheet_to_json(ws, { header: 1 });
+
+      ensureStatusColumn();
+
+      foundRows.clear();
+      newRows.clear();
+      renderTable();
+
+      statusText.textContent = "Excel-Datei geladen. Du kannst jetzt die Kamera starten oder Nummern eintippen.";
+      startCamBtn.disabled = false;
+      saveBtn.disabled = false;
+    };
+
+    reader.readAsArrayBuffer(file);
+  });
+
+  function ensureStatusColumn() {
+    for (let i = 0; i < rows.length; i++) {
+      if (!rows[i]) rows[i] = [];
+      if (rows[i].length < 3) {
+        rows[i][2] = i === 0 ? "Status" : "";
+      }
+    }
+  }
+
+  function renderTable() {
+    dataTableBody.innerHTML = "";
+    rows.forEach((row, index) => {
+      const tr = document.createElement("tr");
+
+      if (foundRows.has(index)) tr.classList.add("found");
+      if (newRows.has(index)) tr.classList.add("newitem");
+
+      const num = row[0] || "";
+      const beschr = row[1] || "";
+      const status = row[2] || "";
+
+      const tdNum = document.createElement("td");
+      tdNum.textContent = num;
+      tr.appendChild(tdNum);
+
+      const tdB = document.createElement("td");
+      tdB.textContent = beschr;
+      tr.appendChild(tdB);
+
+      const tdStatus = document.createElement("td");
+      tdStatus.textContent = status;
+      tr.appendChild(tdStatus);
+
+      dataTableBody.appendChild(tr);
+    });
+  }
+
+  function normalizeExcelCode(value) {
+    if (!value) return "";
+    let s = String(value).trim();
+    if (s.startsWith("R")) s = s.substring(1);
+    return s;
+  }
+
+  function normalizeScannedCode(value) {
+    if (!value) return "";
+    return String(value).replace(/\D/g, "").trim();
+  }
+
+  function handleCode(rawValue) {
+    const code = normalizeScannedCode(rawValue);
+    if (!code) {
+      statusText.textContent = "Konnte keine Zahl erkennen.";
+      return;
+    }
+
+    let foundIndex = -1;
+
+    for (let i = 0; i < rows.length; i++) {
+      const excelVal = rows[i][0];
+      const norm = normalizeExcelCode(excelVal);
+      if (norm === code) {
+        foundIndex = i;
+        break;
+      }
+    }
+
+    if (foundIndex >= 0) {
+      rows[foundIndex][2] = "gefunden";
+      foundRows.add(foundIndex);
+      statusText.textContent = "Nummer " + code + " gefunden.";
+    } else {
+      const newIndex = rows.length;
+      const newRow = ["R" + code, "", "neu"];
+      rows.push(newRow);
+      newRows.add(newIndex);
+      statusText.textContent = "Nummer " + code + " ist neu und wurde hinzugefügt.";
+    }
+
+    renderTable();
+  }
+
+  // Kamera starten
+  startCamBtn.addEventListener("click", async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      statusText.textContent = "Kamera wird von diesem Browser nicht unterstützt.";
+      return;
+    }
+
+    try {
+      videoStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" }
+      });
+      video.srcObject = videoStream;
+      await video.play();
+
+      startCamBtn.disabled = true;
+      captureBtn.disabled = false;
+      stopCamBtn.disabled = false;
+      statusText.textContent = "Kamera läuft. Halte den Aufkleber gut lesbar ins Bild und tippe dann auf 'Nummer aus Bild erkennen'.";
+    } catch (err) {
+      console.error(err);
+      statusText.textContent = "Fehler beim Starten der Kamera: " + err;
+    }
+  });
+
+  // Kamera stoppen
+  stopCamBtn.addEventListener("click", () => {
+    if (videoStream) {
+      videoStream.getTracks().forEach(t => t.stop());
+      videoStream = null;
+      video.srcObject = null;
+    }
+    startCamBtn.disabled = false;
+    captureBtn.disabled = true;
+    stopCamBtn.disabled = true;
+    statusText.textContent = "Kamera gestoppt.";
+  });
+
+  // Bild aufnehmen & Nummer per OCR erkennen
+  captureBtn.addEventListener("click", async () => {
+    if (!videoStream) {
+      statusText.textContent = "Kamera läuft nicht.";
+      return;
+    }
+
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    if (!w || !h) {
+      statusText.textContent = "Video noch nicht bereit, bitte kurz warten.";
+      return;
+    }
+
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, w, h);
+
+    statusText.textContent = "Erkenne Nummer... (kann ein paar Sekunden dauern)";
+
+    try {
+      const { data: { text } } = await Tesseract.recognize(canvas, "eng", {
+        tessedit_char_whitelist: "0123456789",
+      });
+
+      const cleaned = text.replace(/\s+/g, "");
+      // längste Ziffernfolge nehmen
+      const matches = cleaned.match(/\d+/g);
+      if (!matches || matches.length === 0) {
+        statusText.textContent = "Keine Zahl im Bild erkannt.";
+        return;
+      }
+      let best = "";
+      matches.forEach(m => {
+        if (m.length > best.length) best = m;
+      });
+
+      handleCode(best);
+    } catch (err) {
+      console.error(err);
+      statusText.textContent = "Fehler bei der Texterkennung: " + err;
+    }
+  });
+
+  // Manuelle Eingabe
+  manualOkBtn.addEventListener("click", () => {
+    const val = manualInput.value;
+    manualInput.value = "";
+    handleCode(val);
+  });
+
+  manualInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") manualOkBtn.click();
+  });
+
+  // Excel speichern
+  saveBtn.addEventListener("click", () => {
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    XLSX.utils.book_append_sheet(wb, ws, currentSheetName || "Tabelle1");
+
+    const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+    const blob = new Blob([wbout], { type: "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "inventur_auswertung.xlsx";
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+</script>
+
+</body>
+</html>
