@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>Reste-Inventur v4</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<!-- Excel einlesen -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<!-- Barcode-Scanner (1D-Barcodes, z.B. Code128, EAN) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/quagga/1.0.0-beta.2/quagga.min.js"></script>
+
+<style>
+body { font-family: sans-serif; margin: 1rem; }
+h1 { font-size: 1.4rem; margin-bottom: 0.8rem; }
+.section { margin-bottom: 1.2rem; padding: 0.8rem; border: 1px solid #ccc; border-radius: 8px; }
+.small { font-size: 0.85rem; color:#444; }
+
+#camera {
+    width: 100%;
+    max-width: 480px;
+    margin-top: 0.6rem;
+    aspect-ratio: 4 / 3;
+    background: #000;
+    position: relative;
+    overflow: hidden;
+}
+
+#camera video, #camera canvas {
+    width: 100% !important;
+    height: 100% !important;
+    object-fit: cover;
+}
+
+/* Fadenkreuz-Rahmen */
+#camera::after {
+    content: "";
+    position: absolute;
+    inset: 15%;
+    border: 3px solid rgba(255,255,255,0.8);
+    box-sizing: border-box;
+    pointer-events: none;
+}
+
+.ok { color: #0a7a0a; font-weight: bold; }
+.error { color: #c00; font-weight: bold; }
+table { width: 100%; border-collapse: collapse; margin-top: 0.8rem; }
+th, td { border: 1px solid #ddd; padding: 0.4rem; text-align: left; }
+th { background: #f2f2f2; }
+button {
+    padding: 0.45rem 0.9rem;
+    border-radius: 6px;
+    border: 1px solid #999;
+    background: #f5f5f5;
+}
+button:disabled { opacity: 0.5; }
+</style>
+</head>
+<body>
+<h1>Inventur Scanner v4</h1>
+
+<div class="section">
+    <strong>1. Excel-/CSV-Liste laden</strong><br>
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv"><br>
+    <span class="small">
+        Es wird das erste Tabellenblatt, Spalte A gelesen. Jede Zeile = eine zulässige Nummer.
+        Wenn in Excel ein „R“ davor steht (z.B. R357458001), werden automatisch beide Varianten
+        (mit und ohne R) akzeptiert.
+    </span>
+    <p id="listInfo" class="small"></p>
+</div>
+
+<div class="section">
+    <strong>2. Barcode mit Kamera scannen</strong><br>
+    <button id="startBtn" disabled>Scanner starten</button>
+    <button id="stopBtn" disabled>Stoppen</button>
+    <div id="camera"></div>
+    <p id="lastScan" class="small"></p>
+</div>
+
+<div class="section">
+    <strong>3. Ergebnisse</strong>
+    <table>
+        <thead>
+            <tr><th>Nummer</th><th>Status</th></tr>
+        </thead>
+        <tbody id="resultBody"></tbody>
+    </table>
+</div>
+
+<script>
+let validCodes = new Set();
+let scannedRows = new Map();
+let scannerRunning = false;
+
+// -------- Excel einlesen --------
+const fileInput   = document.getElementById("fileInput");
+const listInfo    = document.getElementById("listInfo");
+const startBtn    = document.getElementById("startBtn");
+const stopBtn     = document.getElementById("stopBtn");
+const lastScan    = document.getElementById("lastScan");
+const resultBody  = document.getElementById("resultBody");
+
+fileInput.addEventListener("change", e => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = evt => {
+        validCodes = new Set();
+
+        try {
+            if (file.name.toLowerCase().endsWith(".csv")) {
+                const text = evt.target.result;
+                text.split(/\r?\n/).forEach(line => {
+                    const cell = line.split(/[;,]/)[0];
+                    addCode(cell);
+                });
+            } else {
+                const data = new Uint8Array(evt.target.result);
+                const workbook = XLSX.read(data, {type:"array"});
+                const firstSheet = workbook.SheetNames[0];
+                const sheet = workbook.Sheets[firstSheet];
+                const rows = XLSX.utils.sheet_to_json(sheet, {header:1, defval:""});
+                rows.forEach(row => addCode(row[0]));
+            }
+
+            listInfo.textContent = "Geladene Nummern: " + validCodes.size;
+            startBtn.disabled = validCodes.size === 0;
+        } catch (err) {
+            console.error(err);
+            alert("Fehler beim Lesen der Datei: " + err);
+        }
+    };
+
+    if (file.name.toLowerCase().endsWith(".csv")) {
+        reader.readAsText(file, "UTF-8");
+    } else {
+        reader.readAsArrayBuffer(file);
+    }
+});
+
+function addCode(value) {
+    if (value === undefined || value === null) return;
+    let c = String(value).trim().toUpperCase();
+    if (!c) return;
+    c = c.replace(/\s+/g, "");
+
+    if (c.startsWith("R")) {
+        validCodes.add(c);
+        validCodes.add(c.substring(1));
+    } else {
+        validCodes.add(c);
+    }
+}
+
+// -------- Scanner starten / stoppen (Quagga) --------
+startBtn.addEventListener("click", () => {
+    if (scannerRunning) return;
+
+    const constraints = {
+        width: { ideal: 640 },
+        height: { ideal: 480 },
+        facingMode: "environment"
+    };
+
+    Quagga.init({
+        inputStream : {
+            name : "Live",
+            type : "LiveStream",
+            target: document.querySelector('#camera'),
+            constraints: constraints,
+            area: { // nur mittlerer Bereich
+                top: "20%",
+                right: "10%",
+                left: "10%",
+                bottom: "20%"
+            }
+        },
+        locator: {
+            patchSize: "medium",
+            halfSample: true
+        },
+        decoder : {
+            readers: [
+                "code_128_reader",
+                "ean_reader",
+                "ean_8_reader",
+                "code_39_reader",
+                "upc_reader",
+                "upc_e_reader"
+            ]
+        },
+        locate: true
+    }, function(err) {
+        if (err) {
+            console.error(err);
+            alert("Fehler beim Starten des Scanners: " + err);
+            return;
+        }
+        Quagga.start();
+        scannerRunning = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        lastScan.textContent = "Scanner läuft – Barcode in den Rahmen halten.";
+    });
+
+    Quagga.offDetected(onDetected); // doppelte Listener verhindern
+    Quagga.onDetected(onDetected);
+});
+
+stopBtn.addEventListener("click", () => {
+    if (!scannerRunning) return;
+    Quagga.stop();
+    scannerRunning = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    lastScan.textContent = "Scanner gestoppt.";
+});
+
+function onDetected(result) {
+    if (!result || !result.codeResult || !result.codeResult.code) return;
+
+    const rawCode = result.codeResult.code;
+    const code = rawCode.trim().toUpperCase();
+
+    const isValid = validCodes.has(code);
+    lastScan.textContent = "Letzter Scan: " + code + (isValid ? " (OK)" : " (fehlerhaft)");
+
+    // Ergebniszeile anlegen oder aktualisieren
+    let row = scannedRows.get(code);
+    if (!row) {
+        row = document.createElement("tr");
+        const tdCode = document.createElement("td");
+        const tdStatus = document.createElement("td");
+        tdCode.textContent = code;
+        row.appendChild(tdCode);
+        row.appendChild(tdStatus);
+        resultBody.appendChild(row);
+        scannedRows.set(code, row);
+    }
+    const statusCell = row.cells[1];
+    if (isValid) {
+        statusCell.textContent = "erledigt";
+        statusCell.className = "ok";
+    } else {
+        statusCell.textContent = "fehlerhaft";
+        statusCell.className = "error";
+    }
+}
+</script>
+</body>
+</html>
